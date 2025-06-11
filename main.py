@@ -1674,5 +1674,684 @@ def extract_collections_info(spec: Dict[str, Any]) -> Dict[str, Any]:
         "total_collections": len(collections)
     }
 
+
+@mcp.tool
+def examine_nmdc_slot_page(
+        slot_name: str = "doi_category",
+        schema_base_url: str = "https://microbiomedata.github.io/nmdc-schema/",
+        verbose: bool = False,
+) -> Dict[str, Any]:
+    """
+    Examine a specific NMDC schema slot page to understand its properties and range.
+
+    This function fetches a slot documentation page and extracts information about
+    the slot's range, description, constraints, and valid values.
+
+    Parameters:
+        slot_name (str): Name of the slot to examine (e.g., 'doi_category', 'lat_lon')
+        schema_base_url (str): Base URL of the NMDC schema documentation
+        verbose (bool): If True, print detailed analysis information
+
+    Returns:
+        Dict[str, Any]: Analysis of the slot including range, constraints, and valid values
+    """
+    try:
+        # Import BeautifulSoup for HTML parsing
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            return {"error": "BeautifulSoup4 is required. Install with: pip install beautifulsoup4"}
+
+        # Construct the slot URL
+        slot_url = f"{schema_base_url.rstrip('/')}/{slot_name}/"
+
+        if verbose:
+            print(f"Fetching slot information from: {slot_url}")
+
+        # Fetch the slot documentation page
+        response = requests.get(slot_url)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.content, 'html.parser')
+
+        analysis = {
+            "slot_info": extract_slot_metadata(soup, slot_name),
+            "range_info": extract_slot_range_info(soup, verbose),
+            "constraints": extract_slot_constraints(soup),
+            "usage_info": extract_slot_usage_info(soup),
+            "summary": {}
+        }
+
+        # Generate summary
+        analysis["summary"] = generate_slot_summary(analysis)
+
+        if verbose:
+            print(f"Slot analysis complete for: {slot_name}")
+            print(f"Range: {analysis['range_info'].get('range', 'Unknown')}")
+
+        return analysis
+
+    except requests.exceptions.RequestException as e:
+        return {"error": f"Failed to fetch slot documentation for '{slot_name}': {str(e)}"}
+    except Exception as e:
+        return {"error": f"Error analyzing slot '{slot_name}': {str(e)}"}
+
+
+def extract_slot_metadata(soup, slot_name: str) -> Dict[str, Any]:
+    """Extract metadata about the slot from its documentation page."""
+    metadata = {
+        "slot_name": slot_name,
+        "description": "No description available",
+        "title": "",
+        "uri": ""
+    }
+
+    # Look for slot title/heading
+    title_elem = soup.find('h1') or soup.find('h2')
+    if title_elem:
+        metadata["title"] = title_elem.get_text().strip()
+
+    # Look for slot description - usually in first paragraph or description section
+    desc_candidates = [
+        soup.find('p'),
+        soup.find('div', class_='description'),
+        soup.find('div', id='description'),
+        soup.find('section', class_='description')
+    ]
+
+    for candidate in desc_candidates:
+        if candidate and candidate.get_text().strip():
+            metadata["description"] = candidate.get_text().strip()
+            break
+
+    # Look for URI/identifier information
+    uri_elem = soup.find('code') or soup.find('span', class_='uri')
+    if uri_elem:
+        metadata["uri"] = uri_elem.get_text().strip()
+
+    return metadata
+
+
+def extract_slot_range_info(soup, verbose: bool = False) -> Dict[str, Any]:
+    """Extract range/type information for the slot."""
+    range_info = {
+        "range": "Unknown",
+        "range_type": "unknown",
+        "is_enum": False,
+        "enum_values": [],
+        "is_class": False,
+        "class_name": ""
+    }
+
+    # Look for range information in various formats
+    # Check for "Range:" label and value
+    range_patterns = [
+        r'range:\s*([A-Za-z_][A-Za-z0-9_]*)',
+        r'type:\s*([A-Za-z_][A-Za-z0-9_]*)',
+        r'values?:\s*([A-Za-z_][A-Za-z0-9_]*)'
+    ]
+
+    page_text = soup.get_text()
+    for pattern in range_patterns:
+        matches = re.findall(pattern, page_text, re.IGNORECASE)
+        if matches:
+            range_info["range"] = matches[0]
+            break
+
+    # Look for range information in structured sections
+    # Find any section with "Range" or similar
+    range_sections = soup.find_all(['div', 'section', 'table'],
+                                   string=lambda text: text and 'range' in text.lower())
+
+    for section in range_sections:
+        # Look for links that might indicate the range type
+        links = section.find_all('a')
+        for link in links:
+            link_text = link.get_text().strip()
+            href = link.get('href', '')
+
+            # Check if this points to an enum
+            if 'enum' in href.lower() or link_text.endswith('Enum'):
+                range_info["range"] = link_text
+                range_info["is_enum"] = True
+                range_info["range_type"] = "enum"
+                if verbose:
+                    print(f"Found enum range: {link_text}")
+            # Check if this points to a class
+            elif href and not href.startswith('http') and len(link_text) > 2:
+                range_info["range"] = link_text
+                range_info["is_class"] = True
+                range_info["class_name"] = link_text
+                range_info["range_type"] = "class"
+                if verbose:
+                    print(f"Found class range: {link_text}")
+
+    # Look in tables for structured range information
+    tables = soup.find_all('table')
+    for table in tables:
+        range_data = extract_range_from_table(table, verbose)
+        if range_data:
+            range_info.update(range_data)
+
+    return range_info
+
+
+def extract_range_from_table(table, verbose: bool = False) -> Dict[str, Any]:
+    """Extract range information from a table."""
+    range_data = {}
+
+    rows = table.find_all('tr')
+    for row in rows:
+        cells = row.find_all(['td', 'th'])
+        if len(cells) >= 2:
+            key = cells[0].get_text().strip().lower()
+            value_cell = cells[1]
+
+            if 'range' in key:
+                # Look for links in the value cell
+                link = value_cell.find('a')
+                if link:
+                    range_value = link.get_text().strip()
+                    href = link.get('href', '')
+
+                    range_data["range"] = range_value
+                    if 'enum' in href.lower():
+                        range_data["is_enum"] = True
+                        range_data["range_type"] = "enum"
+                    else:
+                        range_data["is_class"] = True
+                        range_data["class_name"] = range_value
+                        range_data["range_type"] = "class"
+                else:
+                    range_data["range"] = value_cell.get_text().strip()
+
+                if verbose:
+                    print(f"Found range in table: {range_data['range']}")
+                break
+
+    return range_data
+
+
+def extract_slot_constraints(soup) -> Dict[str, Any]:
+    """Extract constraints and validation rules for the slot."""
+    constraints = {
+        "required": False,
+        "multivalued": False,
+        "pattern": "",
+        "minimum_value": None,
+        "maximum_value": None,
+        "valid_values": []
+    }
+
+    # Look for constraint information in tables or structured sections
+    tables = soup.find_all('table')
+
+    for table in tables:
+        rows = table.find_all('tr')
+        for row in rows:
+            cells = row.find_all(['td', 'th'])
+            if len(cells) >= 2:
+                key = cells[0].get_text().strip().lower()
+                value = cells[1].get_text().strip()
+
+                if 'required' in key:
+                    constraints["required"] = value.lower() in ['true', 'yes', '1', 'required']
+                elif 'multivalued' in key or 'multi' in key:
+                    constraints["multivalued"] = value.lower() in ['true', 'yes', '1']
+                elif 'pattern' in key:
+                    constraints["pattern"] = value
+                elif 'minimum' in key or 'min' in key:
+                    try:
+                        constraints["minimum_value"] = float(value)
+                    except ValueError:
+                        pass
+                elif 'maximum' in key or 'max' in key:
+                    try:
+                        constraints["maximum_value"] = float(value)
+                    except ValueError:
+                        pass
+
+    return constraints
+
+
+def extract_slot_usage_info(soup) -> Dict[str, Any]:
+    """Extract information about how the slot is used."""
+    usage = {
+        "used_by_classes": [],
+        "examples": [],
+        "notes": ""
+    }
+
+    # Look for "Used by" sections
+    page_text = soup.get_text()
+    if 'used by' in page_text.lower():
+        # Try to find classes that use this slot
+        used_by_section = soup.find(string=lambda text: text and 'used by' in text.lower())
+        if used_by_section:
+            parent = used_by_section.parent
+            if parent:
+                links = parent.find_all('a')
+                for link in links:
+                    class_name = link.get_text().strip()
+                    if class_name and len(class_name) > 2 and class_name[0].isupper():
+                        usage["used_by_classes"].append(class_name)
+
+    # Look for examples
+    example_indicators = ['example', 'sample', 'instance']
+    for indicator in example_indicators:
+        if indicator in page_text.lower():
+            # Try to extract example values
+            example_section = soup.find(string=lambda text: text and indicator in text.lower())
+            if example_section:
+                parent = example_section.parent
+                if parent:
+                    # Look for code blocks or formatted text
+                    code_blocks = parent.find_all(['code', 'pre'])
+                    for block in code_blocks:
+                        example_text = block.get_text().strip()
+                        if example_text and len(example_text) < 100:
+                            usage["examples"].append(example_text)
+
+    return usage
+
+
+def generate_slot_summary(analysis: Dict[str, Any]) -> Dict[str, Any]:
+    """Generate a summary of the slot analysis."""
+    slot_info = analysis.get("slot_info", {})
+    range_info = analysis.get("range_info", {})
+    constraints = analysis.get("constraints", {})
+    usage = analysis.get("usage_info", {})
+
+    summary = {
+        "slot_name": slot_info.get("slot_name", "Unknown"),
+        "range": range_info.get("range", "Unknown"),
+        "range_type": range_info.get("range_type", "unknown"),
+        "is_enum": range_info.get("is_enum", False),
+        "is_required": constraints.get("required", False),
+        "is_multivalued": constraints.get("multivalued", False),
+        "used_by_class_count": len(usage.get("used_by_classes", [])),
+        "has_examples": len(usage.get("examples", [])) > 0,
+        "has_constraints": any([
+            constraints.get("pattern"),
+            constraints.get("minimum_value") is not None,
+            constraints.get("maximum_value") is not None
+        ]),
+        "analysis_completeness": "partial"
+    }
+
+    # Determine analysis completeness
+    if (summary["range"] != "Unknown" and
+            summary["used_by_class_count"] > 0):
+        if summary["has_examples"] or summary["has_constraints"]:
+            summary["analysis_completeness"] = "comprehensive"
+        else:
+            summary["analysis_completeness"] = "good"
+
+    return summary
+
+
+@mcp.tool
+def examine_nmdc_enum_page(
+        enum_name: str = "DoiCategoryEnum",
+        schema_base_url: str = "https://microbiomedata.github.io/nmdc-schema/",
+        verbose: bool = False,
+) -> Dict[str, Any]:
+    """
+    Examine a specific NMDC schema enum page to understand its valid values.
+
+    This function fetches an enum documentation page and extracts information about
+    the enum's valid values, descriptions, and usage.
+
+    Parameters:
+        enum_name (str): Name of the enum to examine (e.g., 'DoiCategoryEnum', 'EcosystemEnum')
+        schema_base_url (str): Base URL of the NMDC schema documentation
+        verbose (bool): If True, print detailed analysis information
+
+    Returns:
+        Dict[str, Any]: Analysis of the enum including valid values and descriptions
+    """
+    try:
+        # Import BeautifulSoup for HTML parsing
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            return {"error": "BeautifulSoup4 is required. Install with: pip install beautifulsoup4"}
+
+        # Construct the enum URL
+        enum_url = f"{schema_base_url.rstrip('/')}/{enum_name}/"
+
+        if verbose:
+            print(f"Fetching enum information from: {enum_url}")
+
+        # Fetch the enum documentation page
+        response = requests.get(enum_url)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.content, 'html.parser')
+
+        analysis = {
+            "enum_info": extract_enum_metadata(soup, enum_name),
+            "valid_values": extract_enum_values(soup, verbose),
+            "value_descriptions": extract_enum_value_descriptions(soup, verbose),
+            "usage_info": extract_enum_usage_info(soup),
+            "summary": {}
+        }
+
+        # Generate summary
+        analysis["summary"] = generate_enum_summary(analysis)
+
+        if verbose:
+            value_count = len(analysis["valid_values"])
+            print(f"Enum analysis complete for: {enum_name}")
+            print(f"Found {value_count} valid values")
+
+        return analysis
+
+    except requests.exceptions.RequestException as e:
+        return {"error": f"Failed to fetch enum documentation for '{enum_name}': {str(e)}"}
+    except Exception as e:
+        return {"error": f"Error analyzing enum '{enum_name}': {str(e)}"}
+
+
+def extract_enum_metadata(soup, enum_name: str) -> Dict[str, Any]:
+    """Extract metadata about the enum from its documentation page."""
+    metadata = {
+        "enum_name": enum_name,
+        "description": "No description available",
+        "title": "",
+        "uri": ""
+    }
+
+    # Look for enum title/heading
+    title_elem = soup.find('h1') or soup.find('h2')
+    if title_elem:
+        metadata["title"] = title_elem.get_text().strip()
+
+    # Look for enum description
+    desc_candidates = [
+        soup.find('p'),
+        soup.find('div', class_='description'),
+        soup.find('div', id='description'),
+        soup.find('section', class_='description')
+    ]
+
+    for candidate in desc_candidates:
+        if candidate and candidate.get_text().strip():
+            metadata["description"] = candidate.get_text().strip()
+            break
+
+    # Look for URI/identifier information
+    uri_elem = soup.find('code') or soup.find('span', class_='uri')
+    if uri_elem:
+        metadata["uri"] = uri_elem.get_text().strip()
+
+    return metadata
+
+
+def extract_enum_values(soup, verbose: bool = False) -> List[str]:
+    """Extract the valid values from the enum page."""
+    values = []
+
+    # Look for values in various formats
+    # 1. Look for tables with permissible values
+    tables = soup.find_all('table')
+    for table in tables:
+        table_values = extract_values_from_table(table, verbose)
+        if table_values:
+            values.extend(table_values)
+
+    # 2. Look for lists of values
+    lists = soup.find_all(['ul', 'ol'])
+    for lst in lists:
+        list_values = extract_values_from_list(lst, verbose)
+        if list_values:
+            values.extend(list_values)
+
+    # 3. Look for values in text using patterns
+    if not values:
+        text_values = extract_values_from_text(soup, verbose)
+        values.extend(text_values)
+
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_values = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            unique_values.append(value)
+
+    if verbose:
+        print(f"Extracted {len(unique_values)} unique enum values")
+
+    return unique_values
+
+
+def extract_values_from_table(table, verbose: bool = False) -> List[str]:
+    """Extract enum values from a table."""
+    values = []
+
+    # Look for table headers to identify the value column
+    headers = table.find_all('th')
+    header_texts = [th.get_text().strip().lower() for th in headers]
+
+    value_col_index = -1
+    for i, header in enumerate(header_texts):
+        if any(keyword in header for keyword in ['value', 'permissible', 'allowed', 'valid', 'text']):
+            value_col_index = i
+            break
+
+    # If no specific value column found, assume first column
+    if value_col_index == -1:
+        value_col_index = 0
+
+    rows = table.find_all('tr')
+    for row in rows[1:]:  # Skip header row
+        cells = row.find_all(['td', 'th'])
+        if len(cells) > value_col_index:
+            cell_text = cells[value_col_index].get_text().strip()
+            # Clean up the value
+            if cell_text and not cell_text.lower() in ['value', 'description', 'meaning']:
+                # Remove quotes and extra whitespace
+                clean_value = cell_text.strip('"\'').strip()
+                if clean_value and len(clean_value) > 0:
+                    values.append(clean_value)
+                    if verbose:
+                        print(f"Found table value: {clean_value}")
+
+    return values
+
+
+def extract_values_from_list(lst, verbose: bool = False) -> List[str]:
+    """Extract enum values from a list element."""
+    values = []
+
+    items = lst.find_all('li')
+    for item in items:
+        text = item.get_text().strip()
+
+        # Look for patterns like "value: description" or just "value"
+        if ':' in text:
+            value_part = text.split(':')[0].strip()
+        else:
+            value_part = text.strip()
+
+        # Clean up the value
+        clean_value = value_part.strip('"\'').strip()
+
+        # Validate that this looks like an enum value
+        if (clean_value and
+                len(clean_value) > 0 and
+                len(clean_value) < 100 and  # Reasonable length
+                not clean_value.lower().startswith(('the ', 'this ', 'a ', 'an '))):  # Not a description
+            values.append(clean_value)
+            if verbose:
+                print(f"Found list value: {clean_value}")
+
+    return values
+
+
+def extract_values_from_text(soup, verbose: bool = False) -> List[str]:
+    """Extract enum values from free text using patterns."""
+    values = []
+
+    text_content = soup.get_text()
+
+    # Look for common enum value patterns
+    patterns = [
+        r'permissible values?:\s*([^.]+)',
+        r'allowed values?:\s*([^.]+)',
+        r'valid values?:\s*([^.]+)',
+        r'possible values?:\s*([^.]+)',
+        r'values?:\s*([^.]+)'
+    ]
+
+    for pattern in patterns:
+        matches = re.findall(pattern, text_content, re.IGNORECASE)
+        for match in matches:
+            # Split by common separators
+            potential_values = re.split(r'[,;|]', match)
+            for potential_value in potential_values:
+                clean_value = potential_value.strip().strip('"\'').strip()
+                if (clean_value and
+                        len(clean_value) > 0 and
+                        len(clean_value) < 50 and
+                        not any(char in clean_value for char in ['\n', '\t'])):
+                    values.append(clean_value)
+                    if verbose:
+                        print(f"Found text pattern value: {clean_value}")
+
+    return values
+
+
+def extract_enum_value_descriptions(soup, verbose: bool = False) -> Dict[str, str]:
+    """Extract descriptions for enum values if available."""
+    descriptions = {}
+
+    # Look for tables that have both values and descriptions
+    tables = soup.find_all('table')
+    for table in tables:
+        table_descriptions = extract_descriptions_from_table(table, verbose)
+        descriptions.update(table_descriptions)
+
+    # Look for definition lists
+    dl_elements = soup.find_all('dl')
+    for dl in dl_elements:
+        dl_descriptions = extract_descriptions_from_definition_list(dl, verbose)
+        descriptions.update(dl_descriptions)
+
+    return descriptions
+
+
+def extract_descriptions_from_table(table, verbose: bool = False) -> Dict[str, str]:
+    """Extract value-description pairs from a table."""
+    descriptions = {}
+
+    # Get headers to identify columns
+    headers = table.find_all('th')
+    header_texts = [th.get_text().strip().lower() for th in headers]
+
+    value_col = -1
+    desc_col = -1
+
+    for i, header in enumerate(header_texts):
+        if any(keyword in header for keyword in ['value', 'permissible', 'text']):
+            value_col = i
+        elif any(keyword in header for keyword in ['description', 'meaning', 'definition', 'desc']):
+            desc_col = i
+
+    if value_col >= 0 and desc_col >= 0:
+        rows = table.find_all('tr')
+        for row in rows[1:]:  # Skip header
+            cells = row.find_all(['td', 'th'])
+            if len(cells) > max(value_col, desc_col):
+                value = cells[value_col].get_text().strip().strip('"\'')
+                desc = cells[desc_col].get_text().strip()
+
+                if value and desc:
+                    descriptions[value] = desc
+                    if verbose:
+                        print(f"Found description for {value}: {desc[:50]}...")
+
+    return descriptions
+
+
+def extract_descriptions_from_definition_list(dl, verbose: bool = False) -> Dict[str, str]:
+    """Extract value-description pairs from a definition list."""
+    descriptions = {}
+
+    dt_elements = dl.find_all('dt')
+    for dt in dt_elements:
+        value = dt.get_text().strip().strip('"\'')
+        dd = dt.find_next_sibling('dd')
+        if dd:
+            desc = dd.get_text().strip()
+            descriptions[value] = desc
+            if verbose:
+                print(f"Found definition for {value}: {desc[:50]}...")
+
+    return descriptions
+
+
+def extract_enum_usage_info(soup) -> Dict[str, Any]:
+    """Extract information about how the enum is used."""
+    usage = {
+        "used_by_slots": [],
+        "used_by_classes": [],
+        "notes": ""
+    }
+
+    # Look for "Used by" sections
+    page_text = soup.get_text()
+    if 'used by' in page_text.lower():
+        used_by_section = soup.find(string=lambda text: text and 'used by' in text.lower())
+        if used_by_section:
+            parent = used_by_section.parent
+            if parent:
+                links = parent.find_all('a')
+                for link in links:
+                    link_text = link.get_text().strip()
+                    href = link.get('href', '')
+
+                    if '/slots/' in href:
+                        usage["used_by_slots"].append(link_text)
+                    elif link_text and len(link_text) > 2 and link_text[0].isupper():
+                        usage["used_by_classes"].append(link_text)
+
+    return usage
+
+
+def generate_enum_summary(analysis: Dict[str, Any]) -> Dict[str, Any]:
+    """Generate a summary of the enum analysis."""
+    enum_info = analysis.get("enum_info", {})
+    valid_values = analysis.get("valid_values", [])
+    descriptions = analysis.get("value_descriptions", {})
+    usage = analysis.get("usage_info", {})
+
+    summary = {
+        "enum_name": enum_info.get("enum_name", "Unknown"),
+        "total_values": len(valid_values),
+        "values_with_descriptions": len(descriptions),
+        "has_complete_descriptions": len(descriptions) == len(valid_values) and len(valid_values) > 0,
+        "used_by_slots_count": len(usage.get("used_by_slots", [])),
+        "used_by_classes_count": len(usage.get("used_by_classes", [])),
+        "sample_values": valid_values[:5] if valid_values else [],
+        "all_values": valid_values,
+        "analysis_quality": "unknown"
+    }
+
+    # Determine analysis quality
+    if summary["total_values"] > 0:
+        if summary["has_complete_descriptions"] and summary["used_by_slots_count"] > 0:
+            summary["analysis_quality"] = "excellent"
+        elif summary["values_with_descriptions"] > 0 or summary["used_by_slots_count"] > 0:
+            summary["analysis_quality"] = "good"
+        else:
+            summary["analysis_quality"] = "basic"
+    else:
+        summary["analysis_quality"] = "poor"
+
+    return summary
+
+
 if __name__ == "__main__":
     mcp.run()
