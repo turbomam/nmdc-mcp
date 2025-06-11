@@ -1,7 +1,9 @@
 import json
 import pprint
 import re
+import time
 from typing import Any, Dict, List, Optional, Union
+from urllib.parse import urlparse
 
 import requests
 from fastmcp import FastMCP
@@ -86,6 +88,7 @@ def fetch_nmdc_biosample_records_paged(
 
     return all_records
 
+
 @mcp.tool
 def get_samples_above_elevation(min_elevation: int, max_elevation) -> List[Dict[str, Any]]:
     """
@@ -101,12 +104,12 @@ def get_samples_above_elevation(min_elevation: int, max_elevation) -> List[Dict[
     filter_criteria = {
         "elev": {"$gt": min_elevation, "$lt": max_elevation}
     }
-    
+
     records = fetch_nmdc_biosample_records_paged(
         filter_criteria=filter_criteria,
         max_records=10,
     )
-    
+
     return records
 
 
@@ -2349,6 +2352,676 @@ def generate_enum_summary(analysis: Dict[str, Any]) -> Dict[str, Any]:
             summary["analysis_quality"] = "basic"
     else:
         summary["analysis_quality"] = "poor"
+
+    return summary
+
+
+@mcp.tool
+def resolve_doi_to_pdf_access(
+        doi: str,
+        email: str = "research@example.com",
+        include_crossref_metadata: bool = True,
+        include_unpaywall_check: bool = True,
+        verbose: bool = False,
+) -> Dict[str, Any]:
+    """
+    Determine how to get PDF access from a DOI using CrossRef and Unpaywall APIs.
+
+    This function analyzes a DOI to find potential PDF access routes, including:
+    - CrossRef metadata for publication details
+    - Unpaywall API for open access availability
+    - Publisher information and potential access methods
+    - Direct PDF links when available
+
+    Parameters:
+        doi (str): DOI to resolve (e.g., '10.1038/s41586-021-03821-8')
+        email (str): Email for API requests (required for respectful API usage)
+        include_crossref_metadata (bool): Whether to fetch detailed CrossRef metadata
+        include_unpaywall_check (bool): Whether to check Unpaywall for open access
+        verbose (bool): If True, print detailed progress information
+
+    Returns:
+        Dict[str, Any]: Analysis of PDF access options and metadata
+    """
+    try:
+        # Clean and validate DOI
+        clean_doi = clean_doi_string(doi)
+        if not clean_doi:
+            return {"error": f"Invalid DOI format: {doi}"}
+
+        if verbose:
+            print(f"Resolving DOI: {clean_doi}")
+
+        analysis = {
+            "doi": clean_doi,
+            "doi_url": f"https://doi.org/{clean_doi}",
+            "crossref_metadata": {},
+            "unpaywall_data": {},
+            "pdf_access_options": [],
+            "access_summary": {},
+            "publisher_info": {},
+            "timestamp": time.time()
+        }
+
+        # Get CrossRef metadata
+        if include_crossref_metadata:
+            if verbose:
+                print("Fetching CrossRef metadata...")
+            analysis["crossref_metadata"] = get_crossref_metadata(clean_doi, email, verbose)
+
+        # Check Unpaywall for open access
+        if include_unpaywall_check:
+            if verbose:
+                print("Checking Unpaywall for open access...")
+            analysis["unpaywall_data"] = check_unpaywall_access(clean_doi, email, verbose)
+
+        # Analyze PDF access options
+        analysis["pdf_access_options"] = analyze_pdf_access_options(analysis, verbose)
+
+        # Generate access summary
+        analysis["access_summary"] = generate_access_summary(analysis)
+
+        # Extract publisher information
+        analysis["publisher_info"] = extract_publisher_info(analysis)
+
+        if verbose:
+            access_count = len(analysis["pdf_access_options"])
+            print(f"Found {access_count} potential PDF access options")
+
+        return analysis
+
+    except Exception as e:
+        return {"error": f"Error resolving DOI: {str(e)}"}
+
+
+def clean_doi_string(doi: str) -> str:
+    """Clean and validate a DOI string."""
+    if not doi:
+        return ""
+
+    # Remove common prefixes and whitespace
+    doi = doi.strip()
+
+    # Remove URL prefixes if present
+    if doi.startswith('http'):
+        parsed = urlparse(doi)
+        if parsed.path:
+            doi = parsed.path.lstrip('/')
+
+    # Remove 'doi:' prefix if present
+    if doi.lower().startswith('doi:'):
+        doi = doi[4:]
+
+    # Basic DOI format validation (10.xxxx/yyyy)
+    doi_pattern = r'^10\.\d{4,}/[^\s]+$'
+    if re.match(doi_pattern, doi):
+        return doi
+
+    return ""
+
+
+def get_crossref_metadata(doi: str, email: str, verbose: bool = False) -> Dict[str, Any]:
+    """Get metadata from CrossRef API."""
+    metadata = {
+        "status": "unknown",
+        "title": "",
+        "authors": [],
+        "journal": "",
+        "publisher": "",
+        "publication_date": "",
+        "abstract": "",
+        "url": "",
+        "license": [],
+        "references_count": 0,
+        "citations_count": 0,
+        "subject_areas": []
+    }
+
+    try:
+        # CrossRef API endpoint
+        crossref_url = f"https://api.crossref.org/works/{doi}"
+
+        headers = {
+            'User-Agent': f'DOI-Resolver/1.0 (mailto:{email})',
+            'Accept': 'application/json'
+        }
+
+        if verbose:
+            print(f"Fetching from CrossRef: {crossref_url}")
+
+        response = requests.get(crossref_url, headers=headers, timeout=10)
+
+        if response.status_code == 200:
+            data = response.json()
+            work = data.get('message', {})
+
+            metadata["status"] = "found"
+
+            # Extract basic metadata
+            metadata["title"] = ' '.join(work.get('title', ['']))
+            metadata["journal"] = work.get('container-title', [''])[0] if work.get('container-title') else ''
+            metadata["publisher"] = work.get('publisher', '')
+
+            # Extract authors
+            authors = work.get('author', [])
+            for author in authors:
+                given = author.get('given', '')
+                family = author.get('family', '')
+                if given and family:
+                    metadata["authors"].append(f"{given} {family}")
+                elif family:
+                    metadata["authors"].append(family)
+
+            # Extract publication date
+            pub_date = work.get('published-print') or work.get('published-online')
+            if pub_date and 'date-parts' in pub_date:
+                date_parts = pub_date['date-parts'][0]
+                if len(date_parts) >= 3:
+                    metadata["publication_date"] = f"{date_parts[0]}-{date_parts[1]:02d}-{date_parts[2]:02d}"
+                elif len(date_parts) >= 2:
+                    metadata["publication_date"] = f"{date_parts[0]}-{date_parts[1]:02d}"
+                elif len(date_parts) >= 1:
+                    metadata["publication_date"] = str(date_parts[0])
+
+            # Extract abstract if available
+            if 'abstract' in work:
+                metadata["abstract"] = work['abstract'][:500] + "..." if len(work['abstract']) > 500 else work[
+                    'abstract']
+
+            # Extract URL
+            metadata["url"] = work.get('URL', '')
+
+            # Extract license information
+            licenses = work.get('license', [])
+            for license_info in licenses:
+                if 'URL' in license_info:
+                    metadata["license"].append(license_info['URL'])
+
+            # Extract reference and citation counts
+            metadata["references_count"] = len(work.get('reference', []))
+            metadata["citations_count"] = work.get('is-referenced-by-count', 0)
+
+            # Extract subject areas
+            subjects = work.get('subject', [])
+            metadata["subject_areas"] = subjects[:5]  # Limit to first 5
+
+            if verbose:
+                print(f"CrossRef metadata retrieved: {metadata['title'][:50]}...")
+
+        elif response.status_code == 404:
+            metadata["status"] = "not_found"
+            if verbose:
+                print("DOI not found in CrossRef")
+        else:
+            metadata["status"] = "error"
+            if verbose:
+                print(f"CrossRef API error: {response.status_code}")
+
+    except requests.exceptions.RequestException as e:
+        metadata["status"] = "error"
+        metadata["error"] = str(e)
+        if verbose:
+            print(f"CrossRef request failed: {e}")
+
+    return metadata
+
+
+def check_unpaywall_access(doi: str, email: str, verbose: bool = False) -> Dict[str, Any]:
+    """Check Unpaywall API for open access availability."""
+    unpaywall_data = {
+        "status": "unknown",
+        "is_oa": False,
+        "oa_locations": [],
+        "best_oa_location": {},
+        "data_standard": 0,
+        "journal_is_oa": False,
+        "journal_is_in_doaj": False,
+        "has_repository_copy": False
+    }
+
+    try:
+        # Unpaywall API endpoint
+        unpaywall_url = f"https://api.unpaywall.org/v2/{doi}?email={email}"
+
+        if verbose:
+            print(f"Checking Unpaywall: {unpaywall_url}")
+
+        response = requests.get(unpaywall_url, timeout=10)
+
+        if response.status_code == 200:
+            data = response.json()
+
+            unpaywall_data["status"] = "found"
+            unpaywall_data["is_oa"] = data.get('is_oa', False)
+            unpaywall_data["data_standard"] = data.get('data_standard', 0)
+            unpaywall_data["journal_is_oa"] = data.get('journal_is_oa', False)
+            unpaywall_data["journal_is_in_doaj"] = data.get('journal_is_in_doaj', False)
+
+            # Extract OA locations
+            oa_locations = data.get('oa_locations', [])
+            for location in oa_locations:
+                location_info = {
+                    "host_type": location.get('host_type', ''),
+                    "url_for_pdf": location.get('url_for_pdf', ''),
+                    "url_for_landing_page": location.get('url_for_landing_page', ''),
+                    "license": location.get('license', ''),
+                    "is_best": location.get('is_best', False)
+                }
+
+                unpaywall_data["oa_locations"].append(location_info)
+
+                # Check if this is a repository copy
+                if location.get('host_type') == 'repository':
+                    unpaywall_data["has_repository_copy"] = True
+
+                # Store best OA location
+                if location.get('is_best', False):
+                    unpaywall_data["best_oa_location"] = location_info
+
+            if verbose:
+                oa_status = "Open Access" if unpaywall_data["is_oa"] else "Not Open Access"
+                location_count = len(oa_locations)
+                print(f"Unpaywall result: {oa_status} ({location_count} locations)")
+
+        elif response.status_code == 404:
+            unpaywall_data["status"] = "not_found"
+            if verbose:
+                print("DOI not found in Unpaywall")
+        else:
+            unpaywall_data["status"] = "error"
+            if verbose:
+                print(f"Unpaywall API error: {response.status_code}")
+
+    except requests.exceptions.RequestException as e:
+        unpaywall_data["status"] = "error"
+        unpaywall_data["error"] = str(e)
+        if verbose:
+            print(f"Unpaywall request failed: {e}")
+
+    return unpaywall_data
+
+
+def analyze_pdf_access_options(analysis: Dict[str, Any], verbose: bool = False) -> List[Dict[str, Any]]:
+    """Analyze all available PDF access options."""
+    options = []
+
+    crossref_data = analysis.get("crossref_metadata", {})
+    unpaywall_data = analysis.get("unpaywall_data", {})
+
+    # Option 1: Unpaywall open access locations
+    if unpaywall_data.get("is_oa", False):
+        for oa_location in unpaywall_data.get("oa_locations", []):
+            if oa_location.get("url_for_pdf"):
+                option = {
+                    "type": "open_access_pdf",
+                    "source": "unpaywall",
+                    "url": oa_location["url_for_pdf"],
+                    "host_type": oa_location.get("host_type", "unknown"),
+                    "license": oa_location.get("license", ""),
+                    "quality": "high" if oa_location.get("is_best", False) else "medium",
+                    "access_method": "direct_download",
+                    "cost": "free"
+                }
+                options.append(option)
+
+                if verbose:
+                    print(f"Found OA PDF: {option['host_type']} - {option['url'][:50]}...")
+
+    # Option 2: Publisher website (may require subscription)
+    if crossref_data.get("url"):
+        option = {
+            "type": "publisher_website",
+            "source": "crossref",
+            "url": crossref_data["url"],
+            "publisher": crossref_data.get("publisher", ""),
+            "quality": "high",
+            "access_method": "website_visit",
+            "cost": "subscription_required",
+            "notes": "May require institutional access or subscription"
+        }
+        options.append(option)
+
+        if verbose:
+            print(f"Found publisher URL: {option['url'][:50]}...")
+
+    # Option 3: DOI resolver (fallback)
+    doi_url = analysis.get("doi_url", "")
+    if doi_url:
+        option = {
+            "type": "doi_resolver",
+            "source": "doi_system",
+            "url": doi_url,
+            "quality": "medium",
+            "access_method": "redirect",
+            "cost": "unknown",
+            "notes": "Will redirect to publisher or other access point"
+        }
+        options.append(option)
+
+        if verbose:
+            print(f"Added DOI resolver: {doi_url}")
+
+    # Option 4: Repository copies (if available but not direct PDF)
+    if unpaywall_data.get("has_repository_copy", False):
+        for oa_location in unpaywall_data.get("oa_locations", []):
+            if (oa_location.get("host_type") == "repository" and
+                    oa_location.get("url_for_landing_page") and
+                    not oa_location.get("url_for_pdf")):
+
+                option = {
+                    "type": "repository_landing_page",
+                    "source": "unpaywall",
+                    "url": oa_location["url_for_landing_page"],
+                    "host_type": "repository",
+                    "quality": "medium",
+                    "access_method": "website_visit",
+                    "cost": "free",
+                    "notes": "Repository page may have PDF link or access information"
+                }
+                options.append(option)
+
+                if verbose:
+                    print(f"Found repository page: {option['url'][:50]}...")
+
+    # Sort options by quality and cost
+    option_priority = {
+        "open_access_pdf": 1,
+        "repository_landing_page": 2,
+        "publisher_website": 3,
+        "doi_resolver": 4
+    }
+
+    options.sort(key=lambda x: (
+        option_priority.get(x["type"], 999),
+        0 if x.get("cost") == "free" else 1,
+        0 if x.get("quality") == "high" else 1
+    ))
+
+    return options
+
+
+def generate_access_summary(analysis: Dict[str, Any]) -> Dict[str, Any]:
+    """Generate a summary of PDF access possibilities."""
+    options = analysis.get("pdf_access_options", [])
+    unpaywall_data = analysis.get("unpaywall_data", {})
+    crossref_data = analysis.get("crossref_metadata", {})
+
+    summary = {
+        "access_status": "unknown",
+        "open_access_available": unpaywall_data.get("is_oa", False),
+        "total_access_options": len(options),
+        "free_options_count": len([opt for opt in options if opt.get("cost") == "free"]),
+        "paid_options_count": len([opt for opt in options if opt.get("cost") != "free"]),
+        "best_free_option": None,
+        "primary_access_method": "unknown",
+        "publisher": crossref_data.get("publisher", ""),
+        "journal_is_oa": unpaywall_data.get("journal_is_oa", False),
+        "recommendations": []
+    }
+
+    # Find best free option
+    free_options = [opt for opt in options if opt.get("cost") == "free"]
+    if free_options:
+        summary["best_free_option"] = free_options[0]
+        summary["access_status"] = "free_access_available"
+        summary["primary_access_method"] = free_options[0].get("access_method", "unknown")
+    elif options:
+        summary["access_status"] = "subscription_required"
+        summary["primary_access_method"] = options[0].get("access_method", "unknown")
+    else:
+        summary["access_status"] = "no_access_found"
+
+    # Generate recommendations
+    if summary["open_access_available"]:
+        summary["recommendations"].append("Open access PDF available - use Unpaywall link")
+    elif summary["journal_is_oa"]:
+        summary["recommendations"].append("Journal is open access - check publisher website")
+    elif crossref_data.get("publisher"):
+        summary["recommendations"].append(f"Try institutional access through {crossref_data['publisher']}")
+
+    if unpaywall_data.get("has_repository_copy"):
+        summary["recommendations"].append("Repository copy available - may have PDF or contact info")
+
+    if not free_options and options:
+        summary["recommendations"].append("Consider using library services or interlibrary loan")
+
+    return summary
+
+
+def extract_publisher_info(analysis: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract useful publisher information for access strategies."""
+    crossref_data = analysis.get("crossref_metadata", {})
+
+    publisher_info = {
+        "name": crossref_data.get("publisher", ""),
+        "journal": crossref_data.get("journal", ""),
+        "access_patterns": [],
+        "known_strategies": []
+    }
+
+    publisher_name = publisher_info["name"].lower()
+
+    # Add known access patterns for major publishers
+    if "springer" in publisher_name or "nature" in publisher_name:
+        publisher_info["access_patterns"].append("subscription")
+        publisher_info["known_strategies"].extend([
+            "Often available through institutional access",
+            "Nature journals sometimes have open access options",
+            "Check for author preprints on arXiv or bioRxiv"
+        ])
+
+    elif "elsevier" in publisher_name:
+        publisher_info["access_patterns"].append("subscription")
+        publisher_info["known_strategies"].extend([
+            "Requires subscription or institutional access",
+            "Check ScienceDirect for access options",
+            "Look for author preprints in repositories"
+        ])
+
+    elif "wiley" in publisher_name:
+        publisher_info["access_patterns"].append("hybrid")
+        publisher_info["known_strategies"].extend([
+            "Mix of subscription and open access journals",
+            "Check Wiley Online Library",
+            "Some content freely available after embargo period"
+        ])
+
+    elif "public library of science" in publisher_name or "plos" in publisher_name:
+        publisher_info["access_patterns"].append("open_access")
+        publisher_info["known_strategies"].extend([
+            "PLOS journals are fully open access",
+            "PDFs should be freely available",
+            "Check PLOS website directly"
+        ])
+
+    elif "frontiers" in publisher_name:
+        publisher_info["access_patterns"].append("open_access")
+        publisher_info["known_strategies"].extend([
+            "Frontiers journals are open access",
+            "PDFs freely available on publisher website"
+        ])
+
+    elif "mdpi" in publisher_name:
+        publisher_info["access_patterns"].append("open_access")
+        publisher_info["known_strategies"].extend([
+            "MDPI journals are typically open access",
+            "PDFs usually freely available"
+        ])
+
+    else:
+        publisher_info["known_strategies"].append("Check publisher website for access policies")
+
+    return publisher_info
+
+
+@mcp.tool
+def batch_resolve_dois_from_study(
+        study_id: str,
+        email: str = "research@example.com",
+        max_dois: int = 10,
+        include_full_analysis: bool = False,
+        verbose: bool = False,
+) -> Dict[str, Any]:
+    """
+    Batch resolve DOIs from an NMDC Study's associated_dois field.
+
+    This function fetches a study, extracts its DOIs, and analyzes PDF access
+    options for each DOI using CrossRef and Unpaywall.
+
+    Parameters:
+        study_id (str): NMDC Study ID (e.g., 'nmdc:sty-11-34xj1150')
+        email (str): Email for API requests (required for respectful API usage)
+        max_dois (int): Maximum number of DOIs to process
+        include_full_analysis (bool): Whether to include full metadata for each DOI
+        verbose (bool): If True, print detailed progress information
+
+    Returns:
+        Dict[str, Any]: Analysis of all DOIs from the study
+    """
+    try:
+        if verbose:
+            print(f"Fetching study: {study_id}")
+
+        # Fetch the study data
+        study_data = fetch_nmdc_records_paged(
+            collection="study_set",
+            filter_criteria={"id": study_id},
+            max_records=1,
+            verbose=False
+        )
+
+        if not study_data:
+            return {"error": f"Study not found: {study_id}"}
+
+        study = study_data[0]
+        analysis = {
+            "study_id": study_id,
+            "study_title": study.get("title", "Unknown"),
+            "study_description": study.get("description", "")[:200] + "..." if len(
+                study.get("description", "")) > 200 else study.get("description", ""),
+            "total_dois_found": 0,
+            "dois_analyzed": 0,
+            "doi_analyses": {},
+            "access_summary": {},
+            "timestamp": time.time()
+        }
+
+        # Extract DOIs from associated_dois field
+        associated_dois = study.get("associated_dois", [])
+
+        if not associated_dois:
+            if verbose:
+                print("No associated DOIs found in study")
+            analysis["total_dois_found"] = 0
+            return analysis
+
+        analysis["total_dois_found"] = len(associated_dois)
+
+        if verbose:
+            print(f"Found {len(associated_dois)} DOIs, processing up to {max_dois}")
+
+        # Process each DOI (up to max_dois limit)
+        for i, doi_entry in enumerate(associated_dois[:max_dois]):
+            # DOI might be a string or an object
+            if isinstance(doi_entry, str):
+                doi = doi_entry
+            elif isinstance(doi_entry, dict):
+                doi = doi_entry.get("doi", doi_entry.get("id", ""))
+            else:
+                continue
+
+            if not doi:
+                continue
+
+            if verbose:
+                print(f"Processing DOI {i + 1}/{min(len(associated_dois), max_dois)}: {doi}")
+
+            # Resolve the DOI
+            doi_analysis = resolve_doi_to_pdf_access(
+                doi=doi,
+                email=email,
+                include_crossref_metadata=include_full_analysis,
+                include_unpaywall_check=True,
+                verbose=verbose
+            )
+
+            analysis["doi_analyses"][doi] = doi_analysis
+            analysis["dois_analyzed"] += 1
+
+            # Add small delay to be respectful to APIs
+            time.sleep(0.5)
+
+        # Generate overall access summary
+        analysis["access_summary"] = generate_batch_access_summary(analysis)
+
+        if verbose:
+            open_access_count = analysis["access_summary"].get("open_access_count", 0)
+            total_analyzed = analysis["dois_analyzed"]
+            print(f"Batch analysis complete: {open_access_count}/{total_analyzed} DOIs have open access")
+
+        return analysis
+
+    except Exception as e:
+        return {"error": f"Error in batch DOI resolution: {str(e)}"}
+
+
+def generate_batch_access_summary(analysis: Dict[str, Any]) -> Dict[str, Any]:
+    """Generate a summary across multiple DOI analyses."""
+    doi_analyses = analysis.get("doi_analyses", {})
+
+    summary = {
+        "total_analyzed": len(doi_analyses),
+        "open_access_count": 0,
+        "subscription_required_count": 0,
+        "no_access_found_count": 0,
+        "publishers": {},
+        "access_recommendations": [],
+        "best_open_access_dois": []
+    }
+
+    for doi, doi_analysis in doi_analyses.items():
+        if doi_analysis.get("error"):
+            summary["no_access_found_count"] += 1
+            continue
+
+        access_summary = doi_analysis.get("access_summary", {})
+        access_status = access_summary.get("access_status", "unknown")
+
+        if access_status == "free_access_available":
+            summary["open_access_count"] += 1
+            # Store info about good open access options
+            crossref_data = doi_analysis.get("crossref_metadata", {})
+            if crossref_data.get("title"):
+                summary["best_open_access_dois"].append({
+                    "doi": doi,
+                    "title": crossref_data["title"][:100] + "..." if len(crossref_data["title"]) > 100 else
+                    crossref_data["title"],
+                    "journal": crossref_data.get("journal", ""),
+                    "best_url": access_summary.get("best_free_option", {}).get("url", "")
+                })
+
+        elif access_status == "subscription_required":
+            summary["subscription_required_count"] += 1
+        else:
+            summary["no_access_found_count"] += 1
+
+        # Track publishers
+        publisher = access_summary.get("publisher", "")
+        if publisher:
+            summary["publishers"][publisher] = summary["publishers"].get(publisher, 0) + 1
+
+    # Generate recommendations
+    if summary["open_access_count"] > 0:
+        summary["access_recommendations"].append(f"{summary['open_access_count']} publications have free PDF access")
+
+    if summary["subscription_required_count"] > 0:
+        summary["access_recommendations"].append(
+            f"{summary['subscription_required_count']} publications require subscription/institutional access")
+
+    # Publisher-specific recommendations
+    for publisher, count in summary["publishers"].items():
+        if count > 1:
+            summary["access_recommendations"].append(f"Multiple papers from {publisher} - check institutional access")
 
     return summary
 
